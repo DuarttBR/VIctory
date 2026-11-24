@@ -74,6 +74,10 @@ pub extern "system" fn CreateWindowExW(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    // This build's window carries the project's name from the start, not
+    // the title's.
+    let _ = name;
+    let name = w!("rgarage");
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(

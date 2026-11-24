@@ -1974,9 +1974,12 @@ impl Meter {
             buffer.truncate(n.max(0) as usize);
             self.caption = Some(buffer);
         }
-        let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
-        let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
+        if self.caption.is_none() {
+            return;
+        }
+        // This build's window carries the project's name, not the title's.
+        let text = format!("rgarage | {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let mut text: Vec<u16> = text.encode_utf16().collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
         // which may not pump for a while), so a thread of ours does it and
@@ -2636,7 +2639,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
-            w!("VIctory"),
+            w!("rgarage"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
