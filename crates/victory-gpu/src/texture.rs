@@ -518,6 +518,29 @@ pub(crate) fn note_heap_view(resource: This, texture: &ID3D12Resource) {
     if !heap_uploads() {
         return;
     }
+    #[cfg(feature = "diagnostics")]
+    {
+        // Which formats and flags reach here, every 8192 views.
+        static SEEN: Mutex<Vec<((i32, i32), u64)>> = Mutex::new(Vec::new());
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (d.Format.0, d.Flags.0);
+        match seen.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, n)) => *n += 1,
+            None => seen.push((key, 1)),
+        }
+        let total: u64 = seen.iter().map(|(_, n)| n).sum();
+        if total % 8192 == 0 {
+            seen.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+            let top: Vec<String> = seen
+                .iter()
+                .take(14)
+                .map(|((f, fl), n)| format!("f{f}/{fl:#x}:{n}"))
+                .collect();
+            tracing::info!(total, top = top.join(" "), "heap view textures by format/flags");
+        }
+    }
     if !title_written(texture) {
         heap_refusal(0, texture);
         return;
@@ -627,6 +650,32 @@ pub(crate) fn upload_heap(list: &HostList) {
             }
         }
         set.spent = HEAP_BUDGET - budget;
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        // The uploader's state every ten seconds.
+        static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_none_or(|t| t.elapsed().as_secs() >= 10) {
+            *last = Some(std::time::Instant::now());
+            let set = HEAPED.lock().unwrap_or_else(|e| e.into_inner());
+            let (known, fresh, copied) = set.as_ref().map_or((0, 0, 0), |s| {
+                (
+                    s.entries.len(),
+                    s.fresh.len(),
+                    s.entries.values().filter(|h| h.copied.load(Relaxed)).count(),
+                )
+            });
+            tracing::info!(
+                known,
+                waiting_first_check = fresh,
+                copied_at_least_once = copied,
+                copies = HEAP_COPIES.load(Relaxed),
+                uncommitted = HEAP_SKIPS[0].load(Relaxed),
+                zero = HEAP_SKIPS[1].load(Relaxed),
+                "heap texture uploader"
+            );
+        }
     }
     if work.is_empty() {
         return;

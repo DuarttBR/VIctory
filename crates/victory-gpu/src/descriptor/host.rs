@@ -922,8 +922,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             if let Some(texture) = crate::resource::host_resource(resource) {
                 let mut desc = desc.as_ref().map(srv_desc);
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
+                    made_kind(3);
                     return None;
                 }
+                made_kind(0);
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(
@@ -999,10 +1001,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
+                made_kind(1);
                 return make(&view, at);
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
+                made_kind(2);
                 // shortcut: unordered access to a texture the title placed
                 // itself is not mirrored; give it a resource as shader
                 // views of such textures get when a dispatch writes one.
@@ -1019,6 +1023,25 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 buffer_srv(address, len, srv_desc(words), at)
             }
         }
+    }
+}
+
+/// Diagnostics: texture views made in host heaps, by outcome (a texture
+/// with a host copy, a placed texture given one, a placed texture with
+/// none, a format that does not fit), logged at powers of two.
+fn made_kind(kind: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    let n = COUNTS[kind].fetch_add(1, Relaxed) + 1;
+    if n.is_power_of_two() && n >= 64 {
+        let c: Vec<u64> = COUNTS.iter().map(|c| c.load(Relaxed)).collect();
+        tracing::info!(
+            textures = c[0],
+            placed = c[1],
+            placed_without_texture = c[2],
+            format_does_not_fit = c[3],
+            "texture views made in host heaps"
+        );
     }
 }
 

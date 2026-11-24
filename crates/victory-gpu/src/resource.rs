@@ -1602,8 +1602,13 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     });
 
     let overlapping = to_release.len();
-    const MAX_PLACED: usize = 384;
-    const TARGET_PLACED: usize = 256;
+    // The world views thousands of streamed textures at once (11,000 BC7
+    // views in the first minutes of Grand Theft Auto VI's prologue): a cap
+    // of a few hundred released them while their views were still in use,
+    // and each came back as a new, empty host copy. Memory the title
+    // remaps or frees releases them above; this is only a backstop.
+    const MAX_PLACED: usize = 16384;
+    const TARGET_PLACED: usize = 12288;
     if map.len() >= MAX_PLACED {
         let mut entries: Vec<((u64, [u32; 14]), u64, usize)> = map
             .iter()
