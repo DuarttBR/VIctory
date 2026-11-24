@@ -148,6 +148,33 @@ fn mirror(handle: u64) {
     }
 }
 
+/// Sweeps the shader-visible view heap at `heap` for slots the title wrote
+/// without the descriptor API, once per presented frame (see
+/// [`host::HostHeap::sweep`]).
+#[cfg(windows)]
+pub(crate) fn sweep(heap: usize) {
+    if std::env::var_os("RG_HEAP_SWEEP").is_some_and(|v| v == "0") {
+        return;
+    }
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if !heaps.iter().any(|&(_, _, h)| h == heap) {
+        return;
+    }
+    // SAFETY: registered heaps are live (removed when dropped).
+    let title = unsafe { &*(heap as *const Heap) };
+    drop(heaps);
+    if title.samplers() {
+        return;
+    }
+    let Some(Some(host)) = title.host.get() else {
+        return;
+    };
+    let Some(step) = increment(title.desc.kind) else {
+        return;
+    };
+    host.sweep(title.start, u64::from(step), VIEW_TAG);
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]

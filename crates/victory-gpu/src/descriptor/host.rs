@@ -34,6 +34,11 @@ pub(crate) struct HostHeap {
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
+    /// The frame [`HostHeap::sweep`] last ran in, the slots it made so far,
+    /// and the foreign slots it last counted.
+    swept: std::sync::atomic::AtomicU64,
+    swept_made: std::sync::atomic::AtomicU64,
+    swept_foreign: std::sync::atomic::AtomicU64,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -154,6 +159,9 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra + guard) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
+            swept: Default::default(),
+            swept_made: Default::default(),
+            swept_foreign: Default::default(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -412,6 +420,68 @@ impl HostHeap {
             )
         };
         self.keep(index, None);
+    }
+
+    /// Once per presented frame: makes the host slots whose title slot
+    /// holds one of our view records (`tag`) other than the one the host
+    /// slot was made from. The title may copy descriptors with plain memory
+    /// writes (descriptors are memory on the console), which no API call
+    /// reports; shaders indexing the heap directly then read a null host
+    /// slot. Counts slots holding something that is no record of ours.
+    pub(crate) fn sweep(&self, start: u64, step: u64, tag: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let frame = crate::queue::presented();
+        if self.swept.swap(frame, Relaxed) == frame {
+            return;
+        }
+        let mut stale = Vec::new();
+        let mut unmade = Vec::new();
+        let mut foreign = 0u64;
+        {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            for index in 0..self.count {
+                let at = start + u64::from(index) * step;
+                // SAFETY: a descriptor slot in title memory.
+                let [t, i, generation] = unsafe { (at as *const [u32; 3]).read_unaligned() };
+                if t == tag {
+                    let key = u64::from(generation) << 32 | u64::from(i);
+                    // A buffer view is made only for a draw (`mirror`), so
+                    // its host slot stays 0 until one: not stale here.
+                    if made[index as usize] != key && made[index as usize] != 0 {
+                        stale.push((index, at, key));
+                    } else if made[index as usize] == 0 {
+                        unmade.push((index, at, key));
+                    }
+                } else if t != 0 || i != 0 || generation != 0 {
+                    foreign += 1;
+                }
+            }
+        }
+        // Slots never made: made now unless they are buffer views (left
+        // for draws); slots made from another record: made again.
+        let mut made_now = 0u64;
+        for &(index, at, key) in stale.iter().chain(&unmade) {
+            self.mirror(index, at, false);
+            if self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] == key {
+                made_now += 1;
+            }
+        }
+        let before = self.swept_made.fetch_add(made_now, Relaxed);
+        let total = before + made_now;
+        let seen = self.swept_foreign.swap(foreign, Relaxed);
+        if (made_now > 0 && (before == 0 || before.ilog2() != total.ilog2()))
+            || (foreign > 0 && seen == 0)
+        {
+            tracing::info!(
+                made = total,
+                this_frame = made_now,
+                stale = stale.len(),
+                unmade = unmade.len(),
+                free = foreign,
+                slots = self.count,
+                "view heap swept: slots the title wrote without the descriptor API"
+            );
+        }
     }
 
     /// Whether this is a sampler heap.

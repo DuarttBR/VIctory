@@ -8720,8 +8720,23 @@ impl<'a> Lower<'a> {
             }
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
+            // EXPERIMENT (rgarage): `RG_FORCE_COLOR=<n>` writes a constant
+            // (1, 0.5, 0, 1) to render target n of every pixel program, to
+            // tell a value the program computes as zero from a write that
+            // never lands.
+            let comp = el.comp;
+            let force = std::env::var("RG_FORCE_COLOR").ok().and_then(|v| v.parse::<u8>().ok());
+            let x = match force {
+                Some(n) if matches!(e.target, Target::Color(t) if t == n) && comp == 9 => {
+                    let k = [1.0f32, 0.5, 0.0, 1.0][usize::from(col.min(3))];
+                    self.s.m.i32(k.to_bits())
+                }
+                _ => x,
+            };
+            let el = &mut elements(self, primitive)[id];
             let (suffix, x) = match el.comp {
                 9 if half.is_some() => (".f32", self.as_float(x)),
+                9 if std::env::var_os("RG_FORCE_COLOR").is_some() => (".f32", self.as_float(x)),
                 9 => {
                     let f = match self.floats.get(&value) {
                         Some(&f) => f,

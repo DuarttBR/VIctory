@@ -515,7 +515,11 @@ fn heap_uploads() -> bool {
 /// A view of title texture `resource` (host copy `texture`) was made in a
 /// shader-visible heap: shaders may sample it by heap index.
 pub(crate) fn note_heap_view(resource: This, texture: &ID3D12Resource) {
-    if !heap_uploads() || !title_written(texture) {
+    if !heap_uploads() {
+        return;
+    }
+    if !title_written(texture) {
+        heap_refusal(0, texture);
         return;
     }
     let key = resource as usize;
@@ -528,9 +532,11 @@ pub(crate) fn note_heap_view(resource: This, texture: &ID3D12Resource) {
         return;
     }
     let Some(plan) = plan(resource, texture) else {
+        heap_refusal(1, texture);
         return;
     };
     let Some(copy) = crate::resource::host_copy(resource) else {
+        heap_refusal(2, texture);
         return;
     };
     let mut set = HEAPED.lock().unwrap_or_else(|e| e.into_inner());
@@ -549,6 +555,27 @@ pub(crate) fn note_heap_view(resource: This, texture: &ID3D12Resource) {
     );
     set.fresh.push_back(key);
     set.order.push(key);
+}
+
+/// Diagnostics: a heap view's texture [`note_heap_view`] leaves out, by
+/// reason (host-written, no plan, no host copy), logged at powers of two.
+fn heap_refusal(reason: usize, texture: &ID3D12Resource) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static COUNTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    let n = COUNTS[reason].fetch_add(1, Relaxed) + 1;
+    if n.is_power_of_two() {
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        tracing::info!(
+            reason = ["written by the host (target, depth or unordered access)", "no console layout", "no host copy"][reason],
+            n,
+            width = d.Width,
+            height = d.Height,
+            format = d.Format.0,
+            flags = format_args!("{:#x}", d.Flags.0),
+            "heap texture left out"
+        );
+    }
 }
 
 /// Copies into their host copies, in `list` (before what it records next),
@@ -617,13 +644,25 @@ pub(crate) fn upload_heap(list: &HostList) {
         let total = before + copied as u64;
         // At each power of two.
         if before == 0 || before.ilog2() != total.ilog2() {
-            tracing::info!(total, "heap textures copied to the host");
+            let set = HEAPED.lock().unwrap_or_else(|e| e.into_inner());
+            let known = set.as_ref().map_or(0, |s| s.entries.len());
+            tracing::info!(
+                total,
+                known,
+                uncommitted = HEAP_SKIPS[0].load(Relaxed),
+                zero = HEAP_SKIPS[1].load(Relaxed),
+                "heap textures copied to the host"
+            );
         }
     }
 }
 
 /// Heap textures [`upload_heap`] has copied so far.
 static HEAP_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Heap texture checks that found the memory not committed, or all zero.
+static HEAP_SKIPS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Copies heap texture `h` to its host copy in `list` if its memory changed
 /// since the last copy (and holds something); whether it recorded a copy.
@@ -648,6 +687,7 @@ fn heap_upload_one(list: &HostList, h: &Heaped) -> bool {
         &scratch[..]
     } else {
         if !committed(plan.memory, size) {
+            HEAP_SKIPS[0].fetch_add(1, Relaxed);
             return false;
         }
         // SAFETY: committed memory of the texture's layout size.
@@ -661,6 +701,7 @@ fn heap_upload_one(list: &HostList, h: &Heaped) -> bool {
     };
     if !h.copied.load(Relaxed) && tiled.iter().all(|&b| b == 0) {
         // Not streamed yet; the host copy starts zero too.
+        HEAP_SKIPS[1].fetch_add(1, Relaxed);
         return false;
     }
     let Some((buffer, data)) = list.upload(host, plan.total) else {
