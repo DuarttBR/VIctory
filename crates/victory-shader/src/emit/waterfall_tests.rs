@@ -125,8 +125,15 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
         // Both tables start at heap index 0.
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
-            assert_eq!(u.root, RootType::Table, "{u:?}");
-            ud[u.index as usize] = 0;
+            // A heap guard entry (a heap index computed from data) takes the
+            // heap's guard slot; every other entry is a table at 0.
+            ud[u.index as usize] = match super::host::guard(u.root, views.len(), samplers.len()) {
+                Some(guard) => guard,
+                None => {
+                    assert_eq!(u.root, RootType::Table, "{u:?}");
+                    0
+                }
+            };
         }
         let words = host
             .dispatch(
