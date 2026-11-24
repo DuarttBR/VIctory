@@ -442,6 +442,8 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        // Textures shaders sample by heap index, before the work that may.
+        crate::texture::upload_heap(list);
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.

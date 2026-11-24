@@ -11,9 +11,11 @@
 //! submission that samples it.
 //!
 //! shortcut: a change detiles the whole texture, not the pages written.
-//! Only textures read through descriptor tables are brought up to date
-//! (directly indexed views are not known per draw); plane 0 is uploaded
-//! (every mip and array slice), depth and stencil planes are not.
+//! Textures read through descriptor tables are brought up to date per
+//! draw; those with a view in a shader-visible heap, which shaders may
+//! index directly (no draw names them), a few at a time by
+//! [`upload_heap`]. Plane 0 is uploaded (every mip and array slice), depth
+//! and stencil planes are not.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -92,6 +94,11 @@ pub(crate) fn forget(resource: usize) {
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
+    }
+    drop(set);
+    let mut heaped = HEAPED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(heaped) = heaped.as_mut() {
+        heaped.entries.remove(&resource);
     }
 }
 
@@ -244,37 +251,57 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
-        let mut packed = Vec::new();
-        for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
-            let f = footprint.Footprint;
-            let pitch = f.RowPitch as usize;
-            let lines = rows as usize * f.Depth as usize;
-            let len = if self.widened_from.is_some() && lines > 0 {
-                // The last subresource allocation stops at the last row's used bytes.
-                pitch * (lines - 1) + f.Width as usize * 4
-            } else {
-                pitch * lines
-            };
-            // SAFETY: the subresource's part of the mapped staging buffer.
-            let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
-            };
-            if let Err(e) = detile_subresource(
-                &self.layout,
-                tiled,
-                mip,
-                slice,
-                linear,
-                pitch,
-                rows as usize,
-                f.Depth as usize,
-                self.widened_from,
-                &mut packed,
-            ) {
-                tracing::warn!(?e, mip, slice, "texture not detiled");
-                return;
-            }
+        detile_into(
+            &self.footprints,
+            &self.rows,
+            self.mips,
+            &self.layout,
+            self.widened_from,
+            tiled,
+            self.data,
+        );
+    }
+}
+
+/// Detiles `tiled` (a texture's memory in `layout`) into `data`, a mapped
+/// buffer laid out as `footprints` (with `rows` rows each).
+fn detile_into(
+    footprints: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT],
+    rows: &[u32],
+    mips: u32,
+    layout: &victory_formats::texture::Layout,
+    widened_from: Option<u32>,
+    tiled: &[u8],
+    data: *mut u8,
+) {
+    let mut packed = Vec::new();
+    for (i, (footprint, &rows)) in footprints.iter().zip(rows).enumerate() {
+        let (mip, slice) = (i as u32 % mips, i as u32 / mips);
+        let f = footprint.Footprint;
+        let pitch = f.RowPitch as usize;
+        let lines = rows as usize * f.Depth as usize;
+        let len = if widened_from.is_some() && lines > 0 {
+            // The last subresource allocation stops at the last row's used bytes.
+            pitch * (lines - 1) + f.Width as usize * 4
+        } else {
+            pitch * lines
+        };
+        // SAFETY: the subresource's part of the mapped buffer.
+        let linear = unsafe { std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len) };
+        if let Err(e) = detile_subresource(
+            layout,
+            tiled,
+            mip,
+            slice,
+            linear,
+            pitch,
+            rows as usize,
+            f.Depth as usize,
+            widened_from,
+            &mut packed,
+        ) {
+            tracing::warn!(?e, mip, slice, "texture not detiled");
+            return;
         }
     }
 }
@@ -341,6 +368,56 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     if let Some(s) = map.get(&(resource as usize)) {
         return Some(s.clone());
     }
+    let plan = plan(resource, texture)?;
+    let host = host()?;
+    let (buffer, data) = host.upload_buffer(plan.total)?;
+    #[cfg(feature = "diagnostics")]
+    {
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        crate::host::name(&buffer, || {
+            format!(
+                "staging of {resource:?} {}x{}x{} f{}",
+                d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+            )
+        });
+    }
+    tracing::debug!(desc = ?plan.layout.desc, total = plan.total, "texture contents uploaded from title memory");
+    let s = Arc::new(Staging {
+        buffer,
+        #[cfg(feature = "diagnostics")]
+        size: plan.total,
+        data,
+        footprints: plan.footprints,
+        rows: plan.rows,
+        layout: plan.layout,
+        mips: plan.mips,
+        memory: plan.memory,
+        widened_from: plan.widened_from,
+        last: Mutex::default(),
+    });
+    map.insert(resource as usize, s.clone());
+    Some(s)
+}
+
+/// How a title texture's memory becomes its host copy: the host's
+/// subresource footprints (in a buffer of `total` bytes) and the console
+/// layout of the memory.
+struct Plan {
+    total: u64,
+    footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+    rows: Vec<u32>,
+    layout: victory_formats::texture::Layout,
+    /// Mips per array slice.
+    mips: u32,
+    memory: *const u8,
+    /// See [`Staging::widened_from`].
+    widened_from: Option<u32>,
+}
+
+/// The [`Plan`] of title texture `resource` with host copy `texture`; none
+/// for memory without a console layout the host can detile.
+fn plan(resource: This, texture: &ID3D12Resource) -> Option<Plan> {
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
@@ -382,29 +459,249 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
-    crate::host::name(&buffer, || {
-        format!(
-            "staging of {resource:?} {}x{}x{} f{}",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-        )
-    });
-    tracing::debug!(?desc, total, "texture contents uploaded from title memory");
-    let s = Arc::new(Staging {
-        buffer,
-        #[cfg(feature = "diagnostics")]
-        size: total,
-        data,
+    Some(Plan {
+        total,
         footprints,
         rows,
         layout,
         mips: u32::from(d.MipLevels),
         memory,
         widened_from,
-        last: Mutex::default(),
-    });
-    map.insert(resource as usize, s.clone());
-    Some(s)
+    })
+}
+
+/// A title-written texture with a view in a shader-visible heap.
+struct Heaped {
+    plan: Plan,
+    copy: Arc<crate::resource::HostTexture>,
+    /// What the host copy was last made from.
+    last: Mutex<Last>,
+    /// Copied to the host at least once.
+    copied: std::sync::atomic::AtomicBool,
+}
+
+// SAFETY: the title memory is only read, under `last`'s lock.
+unsafe impl Send for Heaped {}
+// SAFETY: as above.
+unsafe impl Sync for Heaped {}
+
+/// The textures [`upload_heap`] keeps up to date.
+#[derive(Default)]
+struct HeapSet {
+    entries: HashMap<usize, Arc<Heaped>>,
+    /// Keys never copied yet, first in line.
+    fresh: std::collections::VecDeque<usize>,
+    /// Every key, checked again in turn from `next`.
+    order: Vec<usize>,
+    next: usize,
+    /// The presented frame `spent` counts for: title memory read in it.
+    frame: u64,
+    spent: u64,
+}
+
+static HEAPED: Mutex<Option<HeapSet>> = Mutex::new(None);
+
+/// Title memory [`upload_heap`] reads per presented frame: what keeps a
+/// world frame from taking seconds more while thousands of streamed
+/// textures are checked.
+const HEAP_BUDGET: u64 = 192 << 20;
+
+/// `RG_HEAP_UPLOADS=0` turns [`upload_heap`] off.
+fn heap_uploads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RG_HEAP_UPLOADS").is_none_or(|v| v != "0"))
+}
+
+/// A view of title texture `resource` (host copy `texture`) was made in a
+/// shader-visible heap: shaders may sample it by heap index.
+pub(crate) fn note_heap_view(resource: This, texture: &ID3D12Resource) {
+    if !heap_uploads() || !title_written(texture) {
+        return;
+    }
+    let key = resource as usize;
+    let known = HEAPED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|s| s.entries.contains_key(&key));
+    if known {
+        return;
+    }
+    let Some(plan) = plan(resource, texture) else {
+        return;
+    };
+    let Some(copy) = crate::resource::host_copy(resource) else {
+        return;
+    };
+    let mut set = HEAPED.lock().unwrap_or_else(|e| e.into_inner());
+    let set = set.get_or_insert_with(HeapSet::default);
+    if set.entries.contains_key(&key) {
+        return;
+    }
+    set.entries.insert(
+        key,
+        Arc::new(Heaped {
+            plan,
+            copy,
+            last: Mutex::default(),
+            copied: false.into(),
+        }),
+    );
+    set.fresh.push_back(key);
+    set.order.push(key);
+}
+
+/// Copies into their host copies, in `list` (before what it records next),
+/// the heap textures whose memory changed: those never copied first, then
+/// the others in turn, reading at most [`HEAP_BUDGET`] of title memory per
+/// presented frame.
+pub(crate) fn upload_heap(list: &HostList) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !heap_uploads() {
+        return;
+    }
+    let frame = crate::queue::presented();
+    let mut work = Vec::new();
+    {
+        let mut guard = HEAPED.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(set) = guard.as_mut() else { return };
+        if set.frame != frame {
+            set.frame = frame;
+            set.spent = 0;
+        }
+        if set.spent >= HEAP_BUDGET || set.entries.is_empty() {
+            return;
+        }
+        if set.order.len() > 2 * set.entries.len() + 64 {
+            let entries = &set.entries;
+            set.order.retain(|k| entries.contains_key(k));
+            set.next = 0;
+        }
+        let mut budget = HEAP_BUDGET - set.spent;
+        while budget > 0
+            && let Some(key) = set.fresh.pop_front()
+        {
+            if let Some(h) = set.entries.get(&key) {
+                budget = budget.saturating_sub(h.plan.layout.size);
+                work.push((key, h.clone()));
+            }
+        }
+        let n = set.order.len();
+        let mut seen = 0;
+        while budget > 0 && seen < n {
+            let key = set.order[set.next % n];
+            set.next = (set.next + 1) % n;
+            seen += 1;
+            if let Some(h) = set.entries.get(&key)
+                && !work.iter().any(|(k, _)| *k == key)
+            {
+                budget = budget.saturating_sub(h.plan.layout.size);
+                work.push((key, h.clone()));
+            }
+        }
+        set.spent = HEAP_BUDGET - budget;
+    }
+    if work.is_empty() {
+        return;
+    }
+    let host_written = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut copied = 0usize;
+    for (key, h) in work {
+        // A texture the host wrote keeps the host's contents (as `upload`).
+        if !host_written.as_ref().is_some_and(|s| s.contains(&key)) && heap_upload_one(list, &h) {
+            copied += 1;
+        }
+    }
+    if copied > 0 {
+        let before = HEAP_COPIES.fetch_add(copied as u64, Relaxed);
+        let total = before + copied as u64;
+        // At each power of two.
+        if before == 0 || before.ilog2() != total.ilog2() {
+            tracing::info!(total, "heap textures copied to the host");
+        }
+    }
+}
+
+/// Heap textures [`upload_heap`] has copied so far.
+static HEAP_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Copies heap texture `h` to its host copy in `list` if its memory changed
+/// since the last copy (and holds something); whether it recorded a copy.
+fn heap_upload_one(list: &HostList, h: &Heaped) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    const COPY_DEST: u32 = 0x400;
+    const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+    let plan = &h.plan;
+    let size = plan.layout.size as usize;
+    let start = plan.memory as usize;
+    let Some(host) = host() else { return false };
+    let mut last = h.last.lock().unwrap_or_else(|e| e.into_inner());
+    let mut scratch;
+    let tiled: &[u8] = if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
+        if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+            return false;
+        }
+        last.asked = now;
+        scratch = SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+        scratch.resize(size, 0);
+        crate::host::copy_mapped(scratch.as_mut_ptr(), plan.memory, size, false);
+        &scratch[..]
+    } else {
+        if !committed(plan.memory, size) {
+            return false;
+        }
+        // SAFETY: committed memory of the texture's layout size.
+        let tiled = unsafe { std::slice::from_raw_parts(plan.memory, size) };
+        let hash = blake3::hash(tiled);
+        if last.hash == Some(hash) {
+            return false;
+        }
+        last.hash = Some(hash);
+        tiled
+    };
+    if !h.copied.load(Relaxed) && tiled.iter().all(|&b| b == 0) {
+        // Not streamed yet; the host copy starts zero too.
+        return false;
+    }
+    let Some((buffer, data)) = list.upload(host, plan.total) else {
+        return false;
+    };
+    detile_into(
+        &plan.footprints,
+        &plan.rows,
+        plan.mips,
+        &plan.layout,
+        plan.widened_from,
+        tiled,
+        data,
+    );
+    drop(last);
+    list.ready_copy(&h.copy, COPY_DEST);
+    let texture = &h.copy.texture;
+    for (i, footprint) in plan.footprints.iter().enumerate() {
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: i as u32,
+            },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(&buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: *footprint,
+            },
+        };
+        // SAFETY: an open list; both locations name live resources.
+        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    }
+    list.ready_copy(&h.copy, SHADER_RESOURCE);
+    list.keep(texture);
+    h.copied.store(true, Relaxed);
+    true
 }
 
 #[cfg(test)]

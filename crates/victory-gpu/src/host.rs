@@ -1050,6 +1050,17 @@ impl HostList {
         }
     }
 
+    /// Moves host texture `copy` to `wanted` (a host state) in this list,
+    /// recording the barrier if that is a change: for a title texture the
+    /// host itself uploads, outside the title's own uses of it.
+    pub(crate) fn ready_copy(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
+        let wanted = legal_state(&copy.texture, wanted);
+        if let Some(barrier) = self.move_to(copy, wanted) {
+            // SAFETY: an open list and a live texture.
+            unsafe { self.list.ResourceBarrier(&[barrier]) };
+        }
+    }
+
     /// [`HostList::track`], with the barrier to record if it is a change.
     fn move_to(&self, copy: &HostCopy, wanted: u32) -> Option<D3D12_RESOURCE_BARRIER> {
         let before = self.track(copy, wanted)?;
