@@ -63,9 +63,12 @@ Our own commits:
 - **Geometry is drawn:** `RG_WORLD_VIEW=1` gives the first whole frames of the world here (the
   prison yard: fences, poles, tables, people) with the interface on top.
 - **Colour comes out zero:** with `RG_FORCE_COLOR=0`, the G-buffer's colour target covers 28% of
-  the frame, so the material passes run and write; the colour they compute is zero. They sample
-  about seven textures each through descriptors loaded from heap memory. Why those reads give
-  zero is what we are working on.
+  the frame, so the material passes run and write; the colour they compute is zero.
+- **The characters' textures do reach the GPU:** with `RG_FORCE_COLOR=tex` (each pixel program
+  writes its first texture sample instead of its colour) and `RG_WORLD_VIEW=albedo`, the
+  prologue's cutscenes show their characters in their clothes' and skin's colours, flat (no light,
+  no texture detail), with the title's subtitles on top. What zeroes the real colour is in the
+  material programs' own arithmetic, which is what we look at next.
 - **Ground and buildings are missing:** most of them come from indirect mesh dispatches that are
   still dropped (`prepare failed`, about 730 per frame).
 - **Shaders:** about 430 programs still do not translate. Most refusals are lane masks used as

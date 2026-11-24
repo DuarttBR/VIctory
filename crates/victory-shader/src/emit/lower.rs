@@ -458,6 +458,10 @@ struct Lower<'a> {
     /// EXPERIMENT (`RG_FORCE_COLOR=tex`): the first texture sample was
     /// written to render target 0.
     forced_sample: bool,
+    /// EXPERIMENT (`RG_FORCE_COLOR=texall`): render targets written from
+    /// texture samples (bit n), and the samples seen.
+    forced_targets: u8,
+    samples_seen: u8,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -1351,6 +1355,8 @@ impl<'a> Lower<'a> {
             abort: None,
             guard_slots: [None; 2],
             forced_sample: false,
+            forced_targets: 0,
+            samples_seen: 0,
         }
     }
 
@@ -7889,6 +7895,34 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
+            // EXPERIMENT (`RG_FORCE_COLOR=uv`): the first sample's
+            // coordinates (fractions) go to render target 0: whether the
+            // texture coordinates vary over a surface.
+            if !f.gather
+                && !self.forced_sample
+                && self.s.pixel
+                && std::env::var("RG_FORCE_COLOR").is_ok_and(|v| v == "uv")
+                && let Some(id) = self
+                    .s
+                    .outputs
+                    .iter()
+                    .position(|o| o.kind == 16 && o.row == Some(0) && o.comp == 9)
+            {
+                self.forced_sample = true;
+                self.s.outputs[id].usage |= 0xF;
+                let one = self.s.m.f32(1.0f32.to_bits());
+                let zero = self.s.m.f32(0);
+                let mut chans = [zero, zero, zero, one];
+                for (k, ch) in chans.iter_mut().enumerate().take(coords.min(2)) {
+                    let floor = self.unary(27, cs[k]);
+                    *ch = self.s.m.bin(c, Bin::Sub, cs[k], floor);
+                }
+                for (ch, x) in chans.into_iter().enumerate() {
+                    let args = vec![self.s.m.i32(id as u32), self.s.m.i32(0), self.s.m.i8(ch as u8), x];
+                    let void = self.s.t.void;
+                    self.s.op(c, "storeOutput.f32", Attr::NoUnwind, void, 5, &args);
+                }
+            }
             // The level clamp, after the coordinates.
             let clamp = if f.cl {
                 float(self, coord_at(coords))?
@@ -8103,6 +8137,30 @@ impl<'a> Lower<'a> {
         };
         // EXPERIMENT (`RG_FORCE_COLOR=tex`): the first texture sample of a
         // pixel program goes to render target 0 as it is.
+        // `RG_FORCE_COLOR=texall`: samples 0, 1, 2, 3 and 4 go to render
+        // targets 0, 1, 2, 3 and 5 (4 is two channels).
+        if sample && !gather && self.s.pixel && std::env::var("RG_FORCE_COLOR").is_ok_and(|v| v == "texall") {
+            let k = self.samples_seen;
+            self.samples_seen = self.samples_seen.saturating_add(1);
+            let target = [0u32, 1, 2, 3, 5].get(usize::from(k)).copied();
+            if let Some(t) = target
+                && let Some(id) = self
+                    .s
+                    .outputs
+                    .iter()
+                    .position(|o| o.kind == 16 && o.row == Some(t) && o.comp == 9)
+            {
+                self.forced_targets |= 1 << t;
+                let cols = self.s.outputs[id].cols.min(4);
+                self.s.outputs[id].usage |= (1u8 << cols) - 1;
+                for ch in 0..cols {
+                    let x = self.s.m.extract(c, r, u32::from(ch));
+                    let args = vec![self.s.m.i32(id as u32), self.s.m.i32(0), self.s.m.i8(ch), x];
+                    let void = self.s.t.void;
+                    self.s.op(c, "storeOutput.f32", Attr::NoUnwind, void, 5, &args);
+                }
+            }
+        }
         if sample
             && !gather
             && !self.forced_sample
@@ -8731,6 +8789,9 @@ impl<'a> Lower<'a> {
         };
         for (id, col, value, half) in stores {
             if self.forced_sample && matches!(e.target, Target::Color(0)) {
+                continue;
+            }
+            if matches!(e.target, Target::Color(t) if t < 8 && self.forced_targets >> t & 1 != 0) {
                 continue;
             }
             let mut x = self.i32_of(value)?;
