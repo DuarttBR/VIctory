@@ -531,7 +531,7 @@ pub(crate) fn note_heap_view(resource: This, texture: &ID3D12Resource) {
             None => seen.push((key, 1)),
         }
         let total: u64 = seen.iter().map(|(_, n)| n).sum();
-        if total % 8192 == 0 {
+        if total.is_multiple_of(8192) {
             seen.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
             let top: Vec<String> = seen
                 .iter()

@@ -1732,12 +1732,20 @@ const MAX_PLANES: u32 = 8;
 /// rgarage world view (`RG_WORLD_VIEW=1`): passes per depth target in the
 /// frame being recorded (keyed by host copy), and the depth the most passes
 /// with colour targets used in the last frame recorded: the world's.
+/// Each entry: passes, the depth, the colour target 0 of its latest pass
+/// with three or more colour targets (the G-buffer's).
 #[allow(clippy::type_complexity)]
 static WORLD_DEPTH: Mutex<(
     u64,
-    Vec<(u32, std::sync::Arc<crate::resource::HostTexture>)>,
-    Option<std::sync::Arc<crate::resource::HostTexture>>,
+    Vec<(u32, std::sync::Arc<crate::resource::HostTexture>, Option<std::sync::Arc<crate::resource::HostTexture>>)>,
+    Option<(std::sync::Arc<crate::resource::HostTexture>, Option<std::sync::Arc<crate::resource::HostTexture>>)>,
 )> = Mutex::new((0, Vec::new(), None));
+
+/// Whether the world view shows the G-buffer colour (`RG_WORLD_VIEW=albedo`).
+fn world_view_albedo() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RG_WORLD_VIEW").is_some_and(|v| v == "albedo"))
+}
 
 /// Whether the world view is on.
 pub(crate) fn world_view_on() -> bool {
@@ -1745,36 +1753,55 @@ pub(crate) fn world_view_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("RG_WORLD_VIEW").is_some_and(|v| v != "0"))
 }
 
-/// Notes the depth of a pass with `targets` colour targets.
-pub(crate) fn note_world_depth(targets: usize, depth: crate::object::This) {
+/// Notes the depth of a pass with `targets` colour targets, the first of
+/// them `first`.
+pub(crate) fn note_world_depth(targets: usize, depth: crate::object::This, first: usize) {
     if targets == 0 || !world_view_on() {
         return;
     }
     let Some(copy) = crate::resource::host_copy(depth) else {
         return;
     };
+    let colour = (targets >= 3)
+        .then(|| crate::resource::host_copy(first as crate::object::This))
+        .flatten();
     let frame = crate::queue::presented();
     let mut w = WORLD_DEPTH.lock().unwrap_or_else(|e| e.into_inner());
     if w.0 != frame {
         // A new frame: the last one's most used depth is the world's.
-        let best = w.1.iter().max_by_key(|(n, _)| *n).map(|(_, c)| c.clone());
+        let best = w
+            .1
+            .iter()
+            .max_by_key(|(n, _, _)| *n)
+            .map(|(_, d, c)| (d.clone(), c.clone()));
         if best.is_some() {
             w.2 = best;
         }
         w.1.clear();
         w.0 = frame;
     }
-    match w.1.iter_mut().find(|(_, c)| std::sync::Arc::ptr_eq(c, &copy)) {
-        Some((n, _)) => *n += 1,
-        None => w.1.push((1, copy)),
+    match w.1.iter_mut().find(|(_, d, _)| std::sync::Arc::ptr_eq(d, &copy)) {
+        Some((n, _, c)) => {
+            *n += 1;
+            if colour.is_some() {
+                *c = colour;
+            }
+        }
+        None => w.1.push((1, copy, colour)),
     }
 }
 
-fn world_view() -> Option<std::sync::Arc<crate::resource::HostTexture>> {
+/// What the world view draws: the texture, and whether it is the depth
+/// (shaded) or the G-buffer colour (shown as it is).
+fn world_view() -> Option<(std::sync::Arc<crate::resource::HostTexture>, bool)> {
     if !world_view_on() {
         return None;
     }
-    WORLD_DEPTH.lock().unwrap_or_else(|e| e.into_inner()).2.clone()
+    let (depth, colour) = WORLD_DEPTH.lock().unwrap_or_else(|e| e.into_inner()).2.clone()?;
+    if world_view_albedo() {
+        return colour.map(|c| (c, false));
+    }
+    Some((depth, true))
 }
 
 /// Built-in fullscreen-triangle compositor for multi-plane `PresentX` calls
@@ -2269,13 +2296,16 @@ impl Host {
                 }
                 // rgarage world view: the depth of the world's G-buffer
                 // pass in the last slot, readable for the frame.
-                let world = world_view().and_then(|depth| {
+                let world = world_view().and_then(|(depth, is_depth)| {
                     let d = depth.texture.GetDesc();
                     let format = match d.Format {
                         DXGI_FORMAT_R32G8X24_TYPELESS => DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
                         DXGI_FORMAT_R32_TYPELESS => DXGI_FORMAT_R32_FLOAT,
                         DXGI_FORMAT_R24G8_TYPELESS => DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
                         DXGI_FORMAT_R16_TYPELESS => DXGI_FORMAT_R16_UNORM,
+                        DXGI_FORMAT_R8G8B8A8_TYPELESS if !is_depth => DXGI_FORMAT_R8G8B8A8_UNORM,
+                        DXGI_FORMAT_R10G10B10A2_TYPELESS if !is_depth => DXGI_FORMAT_R10G10B10A2_UNORM,
+                        f if !is_depth => f,
                         _ => return None,
                     };
                     self.device.CreateShaderResourceView(
@@ -2307,7 +2337,7 @@ impl Host {
                     if state != read {
                         before.push(transition(&depth.texture, state, read));
                     }
-                    Some((depth, state, read))
+                    Some((depth, state, read, is_depth))
                 });
                 before.push(transition(
                     &back,
@@ -2335,9 +2365,9 @@ impl Host {
                 list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 for i in 0..count {
                     let slot = if i == 0 && world.is_some() { MAX_PLANES as u64 } else { i as u64 };
-                    list.SetPipelineState(match i {
-                        0 if world.is_some() => &comp.world,
-                        0 => &comp.opaque,
+                    list.SetPipelineState(match (i, &world) {
+                        (0, Some((_, _, _, true))) => &comp.world,
+                        (0, _) => &comp.opaque,
                         _ => &comp.overlay,
                     });
                     list.SetGraphicsRootDescriptorTable(
@@ -2348,7 +2378,7 @@ impl Host {
                     );
                     list.DrawInstanced(3, 1, 0, 0);
                 }
-                if let Some((depth, state, read)) = &world
+                if let Some((depth, state, read, _)) = &world
                     && state != read
                 {
                     list.ResourceBarrier(&[transition(&depth.texture, *read, *state)]);

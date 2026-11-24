@@ -455,6 +455,9 @@ struct Lower<'a> {
     /// The host's guard slots ([`Lower::heap_guard`]), view heap then
     /// sampler heap, read once.
     guard_slots: [Option<V>; 2],
+    /// EXPERIMENT (`RG_FORCE_COLOR=tex`): the first texture sample was
+    /// written to render target 0.
+    forced_sample: bool,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -1347,6 +1350,7 @@ impl<'a> Lower<'a> {
             counters: HashMap::new(),
             abort: None,
             guard_slots: [None; 2],
+            forced_sample: false,
         }
     }
 
@@ -8097,6 +8101,28 @@ impl<'a> Lower<'a> {
                 &args,
             )
         };
+        // EXPERIMENT (`RG_FORCE_COLOR=tex`): the first texture sample of a
+        // pixel program goes to render target 0 as it is.
+        if sample
+            && !gather
+            && !self.forced_sample
+            && self.s.pixel
+            && std::env::var("RG_FORCE_COLOR").is_ok_and(|v| v == "tex")
+            && let Some(id) = self
+                .s
+                .outputs
+                .iter()
+                .position(|o| o.kind == 16 && o.row == Some(0) && o.comp == 9)
+        {
+            self.forced_sample = true;
+            self.s.outputs[id].usage |= 0xF;
+            for ch in 0..4u8 {
+                let x = self.s.m.extract(c, r, u32::from(ch));
+                let args = vec![self.s.m.i32(id as u32), self.s.m.i32(0), self.s.m.i8(ch), x];
+                let void = self.s.t.void;
+                self.s.op(c, "storeOutput.f32", Attr::NoUnwind, void, 5, &args);
+            }
+        }
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
         };
@@ -8704,6 +8730,9 @@ impl<'a> Lower<'a> {
             (true, true) => ("storePrimitiveOutput", 172),
         };
         for (id, col, value, half) in stores {
+            if self.forced_sample && matches!(e.target, Target::Color(0)) {
+                continue;
+            }
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
                 // An f16 half, declared a 32-bit float on the host.

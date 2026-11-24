@@ -291,7 +291,7 @@ impl State {
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
-            crate::host::note_world_depth(colours, record.resource);
+            crate::host::note_world_depth(colours, record.resource, self.targets.first().copied().unwrap_or(0));
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             Some(host.dsv(texture, record.depth_desc().as_ref()))
