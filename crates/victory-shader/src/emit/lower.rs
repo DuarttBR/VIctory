@@ -4012,8 +4012,14 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        // Scalar loads through a buffer view read it raw, a shader-written
+        // one (unordered access) too: the host makes raw views for dword
+        // loads whatever stride the title's view names.
+        if let Some(u) = kind
+            && matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
+        {
+            let class = if u.kind == ResourceType::Uav { 0x1000 } else { 0 };
+            let h = self.handle(site, src, false, (11 | class, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -4105,19 +4111,40 @@ impl<'a> Lower<'a> {
             Some("x16") => 16,
             _ => return Err("a scalar memory read as data"),
         };
-        // How the program uses the descriptor tells the view's kind.
-        let use_at = self
+        // How the program uses the descriptor tells the view's kind. Prefer an
+        // image or vector buffer use when a descriptor has both scalar and
+        // vector uses, since those carry format and indexing cues.
+        let mut use_at: Option<(Site, u8)> = None;
+        for d in self
             .x
             .res
             .descriptors
             .iter()
             .filter(|d| d.role == Role::Resource)
-            .find_map(|d| {
-                d.source.leaves().into_iter().find_map(|l| match *l {
-                    Source::Loaded { load, first } if load == site => Some((d.site, first)),
-                    _ => None,
-                })
-            });
+        {
+            for l in d.source.leaves() {
+                if let Source::Loaded { load, first } = *l
+                    && load == site
+                {
+                    let ui = &self.x.p.blocks[d.site.0].insts[d.site.1];
+                    let rich = matches!(ui.fields, Fields::Image { .. } | Fields::Buffer { .. });
+                    if use_at.is_none() || rich {
+                        use_at = Some((d.site, first));
+                        if rich {
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some((at, _)) = use_at
+                && matches!(
+                    self.x.p.blocks[at.0].insts[at.1].fields,
+                    Fields::Image { .. } | Fields::Buffer { .. }
+                )
+            {
+                break;
+            }
+        }
         let Some((at, first)) = use_at else {
             return Err("a descriptor read only as data");
         };
@@ -4155,6 +4182,18 @@ impl<'a> Lower<'a> {
                 if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
                     return Err("a constant buffer's descriptor read as data");
                 }
+                (props, None)
+            }
+            Fields::Smem { .. } if un.starts_with("s_buffer_") => {
+                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                    return Err("a constant buffer's descriptor read as data");
+                }
+                let stride = used.map_or(0, |u| u.stride);
+                let props = if stride >= 4 && stride.is_multiple_of(4) {
+                    (12 | u, stride)
+                } else {
+                    (11 | u, 0)
+                };
                 (props, None)
             }
             _ => return Err("a scalar memory read as data"),
@@ -8285,6 +8324,18 @@ impl<'a> Lower<'a> {
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
+            // A register initialized only on one branch may carry a dead
+            // descriptor dword left over from earlier register reuse on the
+            // other branch (guarded by a separate predicate). Only treat a
+            // descriptor-dword `Missing` as fatal when no incoming edge carries
+            // a real data value.
+            let has_data = !bit
+                && p.blocks[b]
+                    .preds
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &q)| self.tail[q].is_some())
+                    .any(|(n, _)| matches!(self.vals.get(&phi.args[n]), Some(Val::I32(_))));
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
@@ -8292,6 +8343,16 @@ impl<'a> Lower<'a> {
                 let arg = phi.args[n];
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
+                    (Some(Val::Missing(why)), false)
+                        if has_data
+                            && matches!(
+                                why,
+                                "a descriptor's address or format read as data"
+                                    | "a descriptor read only as data"
+                            ) =>
+                    {
+                        self.s.m.i32(0)
+                    }
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
