@@ -1006,6 +1006,8 @@ impl State {
             return false;
         }
         #[cfg(feature = "diagnostics")]
+        list.note_indirect((kind, stride, max), arguments, &args);
+        #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });

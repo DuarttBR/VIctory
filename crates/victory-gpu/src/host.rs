@@ -303,6 +303,10 @@ pub(crate) struct HostList {
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
     notes: Mutex<Vec<Note>>,
+    /// The indirect executions the list records, for the device-removed
+    /// report (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    indirects: Mutex<Vec<Indirect>>,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -482,6 +486,8 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
+                indirects: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
             })
         }
@@ -565,6 +571,8 @@ impl Host {
         }
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            #[cfg(feature = "diagnostics")]
+            log_indirects(runs);
             fail(format_args!(
                 "host GPU device removed after a submission of {} lists{}{}",
                 runs.len(),
@@ -883,6 +891,8 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -958,6 +968,21 @@ impl HostList {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
         list.cast().ok()
+    }
+
+    /// Notes an indirect execution about to be recorded (diagnostics): if
+    /// the device is removed, the log shows what its records held.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_indirect(
+        &self,
+        record: (u32, u32, u32),
+        address: u64,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+    ) {
+        self.indirects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((record, address, shadow.clone()));
     }
 
     /// Notes what the command about to be recorded does, as a marker
@@ -1803,6 +1828,44 @@ impl Host {
             }
         }
     }
+}
+
+/// An indirect execution a list recorded: (kind, stride, records), the
+/// records' title address and the buffer copy the GPU reads them from.
+#[cfg(feature = "diagnostics")]
+type Indirect = (
+    (u32, u32, u32),
+    u64,
+    std::sync::Arc<crate::shadow::Shadow>,
+);
+
+/// Logs what the first argument record of each indirect execution of the
+/// failed submission holds in its host copy (diagnostics): bounded where
+/// the GPU got as far as the clamp, as the title's passes (or nobody) left
+/// it after that. Counts come first in every kind of record, so a record
+/// of tens of thousands of groups or millions of vertices at the address
+/// the device stopped at is what ran too long.
+#[cfg(feature = "diagnostics")]
+fn log_indirects(runs: &[&HostList]) {
+    let mut records = 0;
+    for (list, run) in runs.iter().enumerate() {
+        let indirects = run.indirects.lock().unwrap_or_else(|e| e.into_inner());
+        for ((kind, stride, max), address, shadow) in indirects.iter() {
+            let words = shadow.host_words(*address, (*stride as usize / 4).min(5));
+            if records < 4096 {
+                tracing::warn!(
+                    list,
+                    kind,
+                    max,
+                    address = format_args!("{address:#x}"),
+                    ?words,
+                    "indirect record at the failure"
+                );
+            }
+            records += 1;
+        }
+    }
+    tracing::warn!(records, "indirect records of the failed submission");
 }
 
 /// For adapters without device-removed data (the software one): the last

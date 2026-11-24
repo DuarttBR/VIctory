@@ -99,6 +99,22 @@ impl Shadow {
         address - self.start
     }
 
+    /// Up to `n` dwords of the host copy at a title address (diagnostics:
+    /// what the GPU left in an argument record).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn host_words(&self, address: u64, n: usize) -> Vec<u32> {
+        let end = self.start + self.len;
+        (0..n as u64)
+            .map(|i| address + 4 * i)
+            .take_while(|&at| at >= self.start && at + 4 <= end)
+            .map(|at| {
+                let offset = (at - self.start) as usize;
+                // SAFETY: inside the mapping.
+                unsafe { self.data.add(offset).cast::<u32>().read_unaligned() }
+            })
+            .collect()
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
