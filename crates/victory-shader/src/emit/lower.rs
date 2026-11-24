@@ -350,6 +350,9 @@ struct Lower<'a> {
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
     floats: HashMap<Value, V>,
+    /// EXPERIMENT (`RG_FORCE_COLOR=mulops`): the operands of each legacy
+    /// multiply, by its result.
+    legacy_ops: HashMap<V, (V, V)>,
     /// DXIL block per IR block (unreachable: none).
     block: Vec<Option<usize>>,
     cur: usize,
@@ -1288,6 +1291,7 @@ impl<'a> Lower<'a> {
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
             floats: HashMap::new(),
+            legacy_ops: HashMap::new(),
             block: vec![None; p.blocks.len()],
             cur: 0,
             bools: HashMap::new(),
@@ -3103,7 +3107,9 @@ impl<'a> Lower<'a> {
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
         let z = self.s.m.bin(c, Bin::Or, az, bz);
-        self.s.m.select(c, z, zero, m)
+        let r = self.s.m.select(c, z, zero, m);
+        self.legacy_ops.insert(r, (a, b));
+        r
     }
 
     // ---- lane booleans ----
@@ -8787,6 +8793,40 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        // EXPERIMENT (`RG_FORCE_COLOR=mulops`): render target 0 gets the
+        // operands of the legacy multiplies that make its red and green
+        // (a, b of red; a, b of green), instead of their products: which of
+        // the two factors is zero where the colour comes out zero.
+        if matches!(e.target, Target::Color(0))
+            && self.s.pixel
+            && !self.forced_sample
+            && std::env::var("RG_FORCE_COLOR").is_ok_and(|v| v == "mulops")
+            && let Some(id) = self
+                .s
+                .outputs
+                .iter()
+                .position(|o| o.kind == 16 && o.row == Some(0) && o.comp == 9)
+        {
+            let half = self.s.m.f32(0.5f32.to_bits());
+            let mut chans = [half; 4];
+            for (k, value) in [e.values[0], e.values[1]].into_iter().enumerate() {
+                if let Some(v) = value
+                    && let Some(&f) = self.floats.get(&v)
+                    && let Some(&(a, b)) = self.legacy_ops.get(&f)
+                {
+                    chans[2 * k] = a;
+                    chans[2 * k + 1] = b;
+                }
+            }
+            self.forced_sample = true;
+            self.s.outputs[id].usage |= 0xF;
+            let c = self.cur;
+            for (ch, x) in chans.into_iter().enumerate() {
+                let args = vec![self.s.m.i32(id as u32), self.s.m.i32(0), self.s.m.i8(ch as u8), x];
+                let void = self.s.t.void;
+                self.s.op(c, "storeOutput.f32", Attr::NoUnwind, void, 5, &args);
+            }
+        }
         for (id, col, value, half) in stores {
             if self.forced_sample && matches!(e.target, Target::Color(0)) {
                 continue;
