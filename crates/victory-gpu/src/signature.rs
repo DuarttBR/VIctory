@@ -183,8 +183,12 @@ pub(crate) fn decode(stride: u32, raw: &[[u32; 4]]) -> Result<Layout, LayoutErro
 #[repr(C)]
 struct Signature {
     object: Object,
+    /// The record stride and the arguments as the title gave them: what
+    /// `ExecuteIndirect` runs from (console-only types included).
+    stride: u32,
+    arguments: Vec<[u32; 4]>,
     /// `None` (with the reason logged) for a signature that does not decode.
-    #[allow(dead_code)] // for ExecuteIndirect, once it translates
+    #[allow(dead_code)] // for signatures that change root arguments
     layout: Option<Layout>,
 }
 
@@ -224,9 +228,22 @@ pub(crate) extern "system" fn create(
     };
     let signature = Box::new(Signature {
         object: Object::new(&FUNCTIONS),
+        stride: desc.stride,
+        arguments,
         layout,
     });
     object::hand_out(COMMAND_SIGNATURE, signature, iid, &SIGNATURE_IIDS, out)
+}
+
+/// A signature's record stride and arguments (type, then up to three
+/// fields each).
+pub(crate) fn layout<'a>(this: This) -> Option<(u32, &'a [[u32; 4]])> {
+    if this.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes one of our signatures.
+    let s = unsafe { &*this.cast::<Signature>() };
+    Some((s.stride, &s.arguments))
 }
 
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
