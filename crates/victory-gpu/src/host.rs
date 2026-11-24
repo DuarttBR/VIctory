@@ -1975,7 +1975,15 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ));
                 list.ResourceBarrier(&before);
-                list.CopyResource(&back, texture);
+                // Diagnostics: `VICTORY_SHOW_TARGET` shows one of the title's
+                // render targets instead.
+                #[cfg(feature = "diagnostics")]
+                let shown = crate::capture::show(list, &back);
+                #[cfg(not(feature = "diagnostics"))]
+                let shown = false;
+                if !shown {
+                    list.CopyResource(&back, texture);
+                }
                 #[cfg(feature = "diagnostics")]
                 let capture = crate::capture::wanted(frame)
                     .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -2096,9 +2104,17 @@ impl Host {
                 }
                 #[cfg(feature = "diagnostics")]
                 let (capture, probe) = {
+                    // `VICTORY_SHOW_TARGET` shows one of the title's render
+                    // targets over the composited planes.
                     list.ResourceBarrier(&[transition(
                         &back,
                         D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                    crate::capture::show(list, &back);
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
                         D3D12_RESOURCE_STATE_COPY_SOURCE,
                     )]);
                     let capture = crate::capture::wanted(frame)
