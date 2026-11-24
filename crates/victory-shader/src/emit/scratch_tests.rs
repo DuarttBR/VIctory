@@ -213,6 +213,12 @@ fn run(
         for &k in cases {
             let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
             for u in &shader.user_data {
+                // A heap guard entry takes the heap's guard slot: after the
+                // one view below.
+                if let Some(guard) = super::host::guard(u.root, 1, 0) {
+                    ud[u.index as usize] = guard;
+                    continue;
+                }
                 ud[u.index as usize] = match (u.root, u.slot) {
                     (RootType::Constants, 0) => k[u.dword as usize],
                     (RootType::Table, 1) => 0,

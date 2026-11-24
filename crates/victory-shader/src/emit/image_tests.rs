@@ -300,6 +300,12 @@ fn run(
     let (root, pso) = host.compute_pipeline(&s)?;
     let mut data = vec![0; s.user_data_dwords().max(1) as usize];
     for u in &s.user_data {
+        // A heap guard entry takes the heap's guard slot: after the three
+        // views below, or the one sampler.
+        if let Some(guard) = super::host::guard(u.root, 3, 1) {
+            data[u.index as usize] = guard;
+            continue;
+        }
         data[u.index as usize] = match u.slot {
             1 | 2 => 0,
             3 => 2 * 32,
