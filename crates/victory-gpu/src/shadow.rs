@@ -485,6 +485,16 @@ const WINDOW: u64 = 4 << 20;
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+pub(crate) fn evict_loose(at: usize, len: usize) {
+    let at = at as u64;
+    let len = len as u64;
+    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    map.retain(|&(start, size), _| {
+        let end = start.saturating_add(size);
+        !(start < at + len && at < end)
+    });
+}
+
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
@@ -492,6 +502,21 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
     }
+
+    const MAX_LOOSE: usize = 128;
+    const TARGET_LOOSE: usize = 96;
+    if map.len() >= MAX_LOOSE {
+        let keys: Vec<(u64, u64)> = map
+            .iter()
+            .filter(|(_, s)| Arc::strong_count(s) <= 1)
+            .map(|(&k, _)| k)
+            .collect();
+        let count_to_remove = map.len().saturating_sub(TARGET_LOOSE);
+        for k in keys.into_iter().take(count_to_remove) {
+            map.remove(&k);
+        }
+    }
+
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
