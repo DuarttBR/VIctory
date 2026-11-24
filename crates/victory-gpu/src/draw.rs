@@ -287,9 +287,11 @@ impl State {
             rtvs.push(host.rtv(texture, record.desc().as_ref()));
         }
         self.depth = 0;
+        let colours = rtvs.len();
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
+            crate::host::note_world_depth(colours, record.resource);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             Some(host.dsv(texture, record.depth_desc().as_ref()))
@@ -456,6 +458,9 @@ impl State {
                 .map(|h| Some(h.heap.clone()))
                 .collect();
             heaps.iter().flatten().for_each(|h| list.keep(h));
+            for &h in self.heaps.iter().filter(|&&h| h != 0) {
+                crate::descriptor::sweep(h);
+            }
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
             self.host_heaps = self.heaps;

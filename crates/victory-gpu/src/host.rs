@@ -1729,6 +1729,54 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 const BUFFERS: u32 = 2;
 const MAX_PLANES: u32 = 8;
 
+/// rgarage world view (`RG_WORLD_VIEW=1`): passes per depth target in the
+/// frame being recorded (keyed by host copy), and the depth the most passes
+/// with colour targets used in the last frame recorded: the world's.
+#[allow(clippy::type_complexity)]
+static WORLD_DEPTH: Mutex<(
+    u64,
+    Vec<(u32, std::sync::Arc<crate::resource::HostTexture>)>,
+    Option<std::sync::Arc<crate::resource::HostTexture>>,
+)> = Mutex::new((0, Vec::new(), None));
+
+/// Whether the world view is on.
+pub(crate) fn world_view_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RG_WORLD_VIEW").is_some_and(|v| v != "0"))
+}
+
+/// Notes the depth of a pass with `targets` colour targets.
+pub(crate) fn note_world_depth(targets: usize, depth: crate::object::This) {
+    if targets == 0 || !world_view_on() {
+        return;
+    }
+    let Some(copy) = crate::resource::host_copy(depth) else {
+        return;
+    };
+    let frame = crate::queue::presented();
+    let mut w = WORLD_DEPTH.lock().unwrap_or_else(|e| e.into_inner());
+    if w.0 != frame {
+        // A new frame: the last one's most used depth is the world's.
+        let best = w.1.iter().max_by_key(|(n, _)| *n).map(|(_, c)| c.clone());
+        if best.is_some() {
+            w.2 = best;
+        }
+        w.1.clear();
+        w.0 = frame;
+    }
+    match w.1.iter_mut().find(|(_, c)| std::sync::Arc::ptr_eq(c, &copy)) {
+        Some((n, _)) => *n += 1,
+        None => w.1.push((1, copy)),
+    }
+}
+
+fn world_view() -> Option<std::sync::Arc<crate::resource::HostTexture>> {
+    if !world_view_on() {
+        return None;
+    }
+    WORLD_DEPTH.lock().unwrap_or_else(|e| e.into_inner()).2.clone()
+}
+
 /// Built-in fullscreen-triangle compositor for multi-plane `PresentX` calls
 /// (e.g. Series S presenting a 1080p scene plane with a 4K UI overlay plane).
 struct Compositor {
@@ -1736,6 +1784,8 @@ struct Compositor {
     root: ID3D12RootSignature,
     opaque: ID3D12PipelineState,
     overlay: ID3D12PipelineState,
+    /// rgarage world view: the world's depth, shaded.
+    world: ID3D12PipelineState,
     rtv_heap: ID3D12DescriptorHeap,
     srv_heap: ID3D12DescriptorHeap,
     srv_stride: u32,
@@ -1758,6 +1808,38 @@ impl Compositor {
             [RootSignature(RS)]
             float4 ps(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
                 return tex.Sample(smp, uv);
+            }
+            // rgarage world view: the world's depth (reversed: the sky is 0)
+            // shaded by the normal its neighbours give, under a fixed light.
+            float view_z(int2 p) {
+                return 0.1 / max(tex.Load(int3(p, 0)).r, 1e-7);
+            }
+            [RootSignature(RS)]
+            float4 world(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+                uint w, h;
+                tex.GetDimensions(w, h);
+                int2 p = clamp(int2(uv * float2(w, h)), int2(1, 1), int2(w - 2, h - 2));
+                float d = tex.Load(int3(p, 0)).r;
+                float3 sky = lerp(float3(0.62, 0.74, 0.88), float3(0.30, 0.42, 0.62), uv.y);
+                if (d <= 0.0 || d >= 1.0) {
+                    return float4(sky, 1);
+                }
+                float zc = view_z(p);
+                float zl = view_z(p - int2(1, 0)), zr = view_z(p + int2(1, 0));
+                float zu = view_z(p - int2(0, 1)), zd = view_z(p + int2(0, 1));
+                float dzdx = abs(zr - zc) < abs(zc - zl) ? zr - zc : zc - zl;
+                float dzdy = abs(zd - zc) < abs(zc - zu) ? zd - zc : zc - zu;
+                float2 ndc = uv * float2(2, -2) + float2(-1, 1);
+                float ty = 0.6, tx = ty * float(w) / float(h);
+                float3 dx = float3(2.0 / w * tx * zc + ndc.x * tx * dzdx, ndc.y * ty * dzdx, dzdx);
+                float3 dy = float3(ndc.x * tx * dzdy, -2.0 / h * ty * zc + ndc.y * ty * dzdy, dzdy);
+                float3 n = normalize(cross(dy, dx));
+                if (n.z > 0) n = -n;
+                float3 light = normalize(float3(0.45, 0.8, -0.4));
+                float lit = 0.3 + 0.7 * saturate(dot(n, light));
+                float3 c = float3(0.80, 0.76, 0.70) * lit;
+                float fog = saturate(zc * 0.004);
+                return float4(lerp(c, sky, fog * 0.7), 1);
             }
         "#;
         let compile = |entry: PCSTR, target: PCSTR| -> windows::core::Result<ID3DBlob> {
@@ -1796,14 +1878,19 @@ impl Compositor {
         };
         let vs = compile(s!("vs"), s!("vs_5_1"))?;
         let ps = compile(s!("ps"), s!("ps_5_1"))?;
+        let world_ps = compile(s!("world"), s!("ps_5_1"))?;
         // SAFETY: compiled shader blobs live through PSO creation.
         unsafe {
             let vs_bytes =
                 std::slice::from_raw_parts(vs.GetBufferPointer().cast::<u8>(), vs.GetBufferSize());
             let ps_bytes =
                 std::slice::from_raw_parts(ps.GetBufferPointer().cast::<u8>(), ps.GetBufferSize());
+            let world_bytes = std::slice::from_raw_parts(
+                world_ps.GetBufferPointer().cast::<u8>(),
+                world_ps.GetBufferSize(),
+            );
             let root: ID3D12RootSignature = device.CreateRootSignature(0, vs_bytes)?;
-            let make_pso = |blend: bool| -> windows::core::Result<ID3D12PipelineState> {
+            let make_with = |blend: bool, ps_bytes: &[u8]| -> windows::core::Result<ID3D12PipelineState> {
                 let mut rt_blend = D3D12_RENDER_TARGET_BLEND_DESC {
                     RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
                     ..Default::default()
@@ -1852,8 +1939,9 @@ impl Compositor {
                 let _ = std::mem::ManuallyDrop::into_inner(desc.pRootSignature);
                 pso
             };
-            let opaque = make_pso(false)?;
-            let overlay = make_pso(true)?;
+            let opaque = make_with(false, ps_bytes)?;
+            let overlay = make_with(true, ps_bytes)?;
+            let world = make_with(false, world_bytes)?;
             let rtv_heap: ID3D12DescriptorHeap =
                 device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
@@ -1864,7 +1952,8 @@ impl Compositor {
             let srv_heap: ID3D12DescriptorHeap =
                 device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    NumDescriptors: MAX_PLANES,
+                    // One more for the world view's depth.
+                    NumDescriptors: MAX_PLANES + 1,
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                     NodeMask: 0,
                 })?;
@@ -1875,6 +1964,7 @@ impl Compositor {
                 root,
                 opaque,
                 overlay,
+                world,
                 rtv_heap,
                 srv_heap,
                 srv_stride,
@@ -2177,6 +2267,48 @@ impl Host {
                         ));
                     }
                 }
+                // rgarage world view: the depth of the world's G-buffer
+                // pass in the last slot, readable for the frame.
+                let world = world_view().and_then(|depth| {
+                    let d = depth.texture.GetDesc();
+                    let format = match d.Format {
+                        DXGI_FORMAT_R32G8X24_TYPELESS => DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+                        DXGI_FORMAT_R32_TYPELESS => DXGI_FORMAT_R32_FLOAT,
+                        DXGI_FORMAT_R24G8_TYPELESS => DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+                        DXGI_FORMAT_R16_TYPELESS => DXGI_FORMAT_R16_UNORM,
+                        _ => return None,
+                    };
+                    self.device.CreateShaderResourceView(
+                        &depth.texture,
+                        Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: format,
+                            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Texture2D: D3D12_TEX2D_SRV {
+                                    MostDetailedMip: 0,
+                                    MipLevels: 1,
+                                    PlaneSlice: 0,
+                                    ResourceMinLODClamp: 0.0,
+                                },
+                            },
+                        }),
+                        D3D12_CPU_DESCRIPTOR_HANDLE {
+                            ptr: srv_cpu_base.ptr + MAX_PLANES as usize * comp.srv_stride as usize,
+                        },
+                    );
+                    let state = D3D12_RESOURCE_STATES(
+                        depth.state.load(std::sync::atomic::Ordering::Relaxed) as i32,
+                    );
+                    let read = D3D12_RESOURCE_STATES(
+                        legal_state(&depth.texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32)
+                            as i32,
+                    );
+                    if state != read {
+                        before.push(transition(&depth.texture, state, read));
+                    }
+                    Some((depth, state, read))
+                });
                 before.push(transition(
                     &back,
                     D3D12_RESOURCE_STATE_PRESENT,
@@ -2202,14 +2334,24 @@ impl Host {
                 list.OMSetRenderTargets(1, Some(&rtv), false, None);
                 list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 for i in 0..count {
-                    list.SetPipelineState(if i == 0 { &comp.opaque } else { &comp.overlay });
+                    let slot = if i == 0 && world.is_some() { MAX_PLANES as u64 } else { i as u64 };
+                    list.SetPipelineState(match i {
+                        0 if world.is_some() => &comp.world,
+                        0 => &comp.opaque,
+                        _ => &comp.overlay,
+                    });
                     list.SetGraphicsRootDescriptorTable(
                         0,
                         D3D12_GPU_DESCRIPTOR_HANDLE {
-                            ptr: srv_gpu_base.ptr + (i as u64) * u64::from(comp.srv_stride),
+                            ptr: srv_gpu_base.ptr + slot * u64::from(comp.srv_stride),
                         },
                     );
                     list.DrawInstanced(3, 1, 0, 0);
+                }
+                if let Some((depth, state, read)) = &world
+                    && state != read
+                {
+                    list.ResourceBarrier(&[transition(&depth.texture, *read, *state)]);
                 }
                 #[cfg(feature = "diagnostics")]
                 let (capture, probe) = {
