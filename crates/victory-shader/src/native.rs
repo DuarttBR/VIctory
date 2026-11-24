@@ -568,7 +568,16 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         // constants, so a parameter at, say, user-data dword 90 would ask
         // for a root signature past D3D12's 64 dwords, which the device
         // refuses to create.
-        if !params_in_user_data(stage, &layout) {
+        // A compute program whose parameters all sit past its user data gets
+        // them through the spill table `s[0:1]` points to instead
+        // ([`NativeProgram::spills_root_args`], asked below once the stage
+        // data is read): those are read from memory, not declared as user
+        // data.
+        let past_user_data = !params_in_user_data(stage, &layout);
+        let spill_shape = stage == HwStage::Cs
+            && !layout.is_empty()
+            && layout.iter().all(|p| stage.user_sgpr(p.user_data) >= 16);
+        if past_user_data && !spill_shape {
             return Err(Malformed("root parameter past the user data"));
         }
         // A table or heap parameter is one 32-bit address. Resource tracking
@@ -679,11 +688,19 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         let io = match stage {
             HwStage::Ps => ps_io(stage_data, code.len())?,
             HwStage::Vs => vs_outputs_per_vertex(vs_inputs_fit(vs_io(stage_data)?, vgprs)?)?,
-            HwStage::Cs => StageIo::Cs(compute_io(stage_data, &layout, vgprs)?),
+            // A layout past the user data is named for that before anything
+            // in the stage data, as when it was refused outright.
+            HwStage::Cs => match compute_io(stage_data, &layout, vgprs) {
+                Ok(io) => StageIo::Cs(io),
+                Err(_) if past_user_data => {
+                    return Err(Malformed("root parameter past the user data"));
+                }
+                Err(e) => return Err(e),
+            },
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
             _ => StageIo::None,
         };
-        out.push(NativeProgram {
+        let program = NativeProgram {
             stage,
             wave64: u32_at(record, RECORD_FLAGS)? & FLAG_WAVE32 == 0,
             vgprs,
@@ -691,7 +708,11 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
             used,
             io,
             code: code.to_vec(),
-        });
+        };
+        if past_user_data && !program.spills_root_args() {
+            return Err(Malformed("root parameter past the user data"));
+        }
+        out.push(program);
     }
     Ok(out)
 }
@@ -1620,9 +1641,7 @@ mod tests {
         assert!(program(0, descriptor, 2, 14).is_ok());
         for (root, sgprs, user_data, what) in [
             (constants, 17, 0, "seventeen dwords"),
-            (constants, 1, 16, "constants at dword 16"),
             (descriptor, 1, 15, "a descriptor's high half at dword 16"),
-            (table, 1, 40, "a table at dword 40"),
         ] {
             assert!(
                 matches!(
@@ -1632,6 +1651,15 @@ mod tests {
                 "{what}"
             );
         }
+        // A program whose parameters all sit past the user data has them
+        // spilled to a table in memory, unless the hardware puts something
+        // of its own in s16 on (here group id x, after 16 user SGPRs).
+        assert!(program(0, constants, 1, 16).is_ok());
+        assert!(program(0, table, 1, 40).is_ok());
+        assert!(matches!(
+            program(16 << 1 | 1 << 7, constants, 1, 16),
+            Err(Malformed("root parameter past the user data"))
+        ));
         for (root, sgprs, user_data, what) in [
             (constants, 5, 0, "five dwords from s0 reach group id x"),
             (descriptor, 1, 3, "a descriptor's high half in s4"),
@@ -3752,10 +3780,13 @@ mod tests {
                     "{root}/{sgprs} at s1"
                 );
             }
-            // Compute's user data ends at dword 15 for a heap too.
+            // Compute's user data ends at dword 15 for a heap too; alone
+            // past it, the heap is spilled like any parameter, unless s16
+            // is taken (group id x after 16 user SGPRs).
             assert!(compute_program(0, root, 1, 15).is_ok(), "{root}");
+            assert!(compute_program(0, root, 1, 16).is_ok(), "{root}");
             assert_eq!(
-                why_refused(compute_program(0, root, 1, 16)),
+                why_refused(compute_program(16 << 1 | 1 << 7, root, 1, 16)),
                 "root parameter past the user data",
                 "{root}"
             );
@@ -3923,11 +3954,14 @@ mod tests {
             why_refused(program(&[(table, 0, 4, 1), (table, 0, 4, 2)])),
             "root parameters share an SGPR"
         );
-        // Compute has 16 user-data dwords and runs the same rule.
+        // Compute has 16 user-data dwords and runs the same rule, unless
+        // every parameter sits past them: the console spills those to a
+        // table in memory.
         let cs = |params: &[(u32, u32, u8, u8)]| stage_layout(HwStage::Cs, params);
         assert!(cs(&[(table, 0, 15, 1)]).is_ok());
+        assert!(cs(&[(table, 0, 16, 1)]).is_ok());
         assert_eq!(
-            why_refused(cs(&[(table, 0, 16, 1)])),
+            why_refused(cs(&[(constants, 1, 0, 0), (table, 0, 16, 1)])),
             "root parameter past the user data"
         );
     }
